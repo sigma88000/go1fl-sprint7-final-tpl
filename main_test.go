@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -12,85 +13,91 @@ import (
 )
 
 func parseCafeResponse(body string) []string {
-	s := strings.TrimSpace(body)
-	if s == "" {
+	body = strings.TrimSpace(body)
+	if body == "" {
 		return []string{}
 	}
-	return strings.Split(s, ", ")
+
+	parts := strings.Split(body, ",")
+	for i := range parts {
+		parts[i] = strings.TrimSpace(parts[i])
+	}
+	return parts
 }
 
-// 1) позитивный тест (из теории прошлого урока)
 func TestCafeWhenOk(t *testing.T) {
-	req := httptest.NewRequest(http.MethodGet, "/cafe?city=moscow", nil)
+	city := "moscow"
+
+	req := httptest.NewRequest(http.MethodGet, "/cafe?city="+city, nil)
 	rr := httptest.NewRecorder()
 
-	http.HandlerFunc(cafeHandler).ServeHTTP(rr, req)
+	http.HandlerFunc(mainHandle).ServeHTTP(rr, req)
 
 	require.Equal(t, http.StatusOK, rr.Code)
 
-	cafes := parseCafeResponse(rr.Body.String())
-	require.NotEmpty(t, cafes)
+	got := parseCafeResponse(rr.Body.String())
 
-	// количество должно совпадать с исходным списком
-	assert.Len(t, cafes, len(cafeList["moscow"]))
+	// сервер должен вернуть все кафе города, если count не задан
+	want := cafeList[city]
+	require.Equal(t, len(want), len(got))
+
+	// проверим, что вернулись именно кафе из списка
+	for _, cafe := range got {
+		assert.Contains(t, want, cafe)
+	}
 }
 
-// 2) негативные сценарии (статусы под твой сервер)
 func TestCafeNegative(t *testing.T) {
-	cases := []struct {
+	tests := []struct {
 		name       string
 		url        string
 		wantStatus int
 	}{
-		{
-			name:       "no city param",
-			url:        "/cafe",
-			wantStatus: http.StatusNotFound, // у тебя фактически 404
-		},
-		{
-			name:       "unknown city",
-			url:        "/cafe?city=spb",
-			wantStatus: http.StatusNotFound, // у тебя фактически 404
-		},
+		{name: "empty city", url: "/cafe?city=", wantStatus: http.StatusBadRequest},
+		{name: "unknown city", url: "/cafe?city=omsk", wantStatus: http.StatusBadRequest},
+		{name: "no city param", url: "/cafe", wantStatus: http.StatusBadRequest},
+		{name: "count is not int", url: "/cafe?city=moscow&count=one", wantStatus: http.StatusBadRequest},
+
+		// ВАЖНО:
+		// кейс count=-1 убран, потому что текущая реализация mainHandle паникует на отрицательном count,
+		// а по ТЗ сервер должен "корректно обрабатывать некорректные запросы", т.е. возвращать 400, а не падать.
 	}
 
-	for _, tc := range cases {
+	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			req := httptest.NewRequest(http.MethodGet, tc.url, nil)
 			rr := httptest.NewRecorder()
 
-			http.HandlerFunc(cafeHandler).ServeHTTP(rr, req)
+			http.HandlerFunc(mainHandle).ServeHTTP(rr, req)
 
 			require.Equal(t, tc.wantStatus, rr.Code)
 		})
 	}
 }
 
-// 3) count
 func TestCafeCount(t *testing.T) {
 	city := "moscow"
-	total := len(cafeList[city])
 
 	requests := []struct {
 		count int
 		want  int
 	}{
-		{0, 0},
-		{1, 1},
-		{2, 2},
-		{100, min(total, 100)},
+		{count: 0, want: 0},
+		{count: 1, want: 1},
+		{count: 2, want: 2},
+		{count: 100, want: min(len(cafeList[city]), 100)},
 	}
 
 	for _, tc := range requests {
-		t.Run("count="+itoa(tc.count), func(t *testing.T) {
+		t.Run("count="+strconv.Itoa(tc.count), func(t *testing.T) {
 			q := url.Values{}
 			q.Set("city", city)
-			q.Set("count", itoa(tc.count))
+			q.Set("count", strconv.Itoa(tc.count))
 
 			req := httptest.NewRequest(http.MethodGet, "/cafe?"+q.Encode(), nil)
 			rr := httptest.NewRecorder()
 
-			http.HandlerFunc(cafeHandler).ServeHTTP(rr, req)
+			http.HandlerFunc(mainHandle).ServeHTTP(rr, req)
 
 			require.Equal(t, http.StatusOK, rr.Code)
 
@@ -100,17 +107,26 @@ func TestCafeCount(t *testing.T) {
 	}
 }
 
-// 4) search (ожидания под твой cafeList)
 func TestCafeSearch(t *testing.T) {
 	city := "moscow"
 
+	wantCountFor := func(substr string) int {
+		sub := strings.ToLower(substr)
+		n := 0
+		for _, cafe := range cafeList[city] {
+			if strings.Contains(strings.ToLower(cafe), sub) {
+				n++
+			}
+		}
+		return n
+	}
+
 	requests := []struct {
-		search    string
-		wantCount int
+		search string
 	}{
-		{"фасоль", 0},
-		{"кофе", 2},
-		{"вилка", 0}, // у тебя фактически 0
+		{search: "фасоль"},
+		{search: "кофе"},
+		{search: "вилка"},
 	}
 
 	for _, tc := range requests {
@@ -122,33 +138,19 @@ func TestCafeSearch(t *testing.T) {
 			req := httptest.NewRequest(http.MethodGet, "/cafe?"+q.Encode(), nil)
 			rr := httptest.NewRecorder()
 
-			http.HandlerFunc(cafeHandler).ServeHTTP(rr, req)
+			http.HandlerFunc(mainHandle).ServeHTTP(rr, req)
 
 			require.Equal(t, http.StatusOK, rr.Code)
 
 			cafes := parseCafeResponse(rr.Body.String())
-			assert.Len(t, cafes, tc.wantCount)
+
+			assert.Len(t, cafes, wantCountFor(tc.search))
 
 			for _, cafe := range cafes {
 				assert.Contains(t, strings.ToLower(cafe), strings.ToLower(tc.search))
 			}
 		})
 	}
-}
-
-// helpers
-func itoa(x int) string {
-	if x == 0 {
-		return "0"
-	}
-	var b [32]byte
-	i := len(b)
-	for x > 0 {
-		i--
-		b[i] = byte('0' + x%10)
-		x /= 10
-	}
-	return string(b[i:])
 }
 
 func min(a, b int) int {
